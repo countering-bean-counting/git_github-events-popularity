@@ -1,0 +1,152 @@
+---
+title: "IBM Trusted AI Open Source Projects"
+author: "Augustina Ragwitz"
+output: html_document
+params:
+  clearbit_api_key: !r Sys.getenv("API_KEY_CLEARBIT")
+  gitlog_rds: !r here::here("ibm-trusted-ai", "data", "gitlog.Rds")
+  gitlog_network_rds: !r here::here("ibm-trusted-ai", "data", "gitlog_network.Rds")
+  gitlog_network_domains_rds: !r here::here("ibm-trusted-ai", "data", "gitlog_network_domains.Rds")
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+
+source(here::here("R", "git-commit-log.R"))
+source(here::here("R", "git-commit-log-email-network.R"))
+```
+
+# Overview
+
+What can Github commit and event logs show us about the value of IBM's Trusted AI projects? Who (segments, not individual) is engaging with these projects? How are they engaging with the projects?
+
+# Data Wrangling
+
+Retrieval and cleaning
+
+
+```{r repositories}
+
+repos <- c(
+  "ibm/aif360",
+  "ibm/aix360",
+  "ibm/adversarial-robustness-toolbox"
+)
+```
+
+## Git Commit Logs
+
+Clone the repos we're interested in.
+
+```{r git_clone, eval=FALSE, echo=FALSE, message=FALSE}
+
+# Clone the repo into the data directory for this project - set eval to FALSE so we don't do this each time
+clone_path <- here::here("ibm-trusted-ai", "repos", "commits")
+
+for (repo in repos) {
+  clone_path_full <- get_git_clone_path_full(repo, clone_path)
+  
+  if (dir.exists(clone_path_full)) {
+    git_cmd <- get_git_pull_repo_cmd(repo, clone_path)
+  } else {
+    #dir.create(clone_path_full)
+    git_cmd <- get_git_clone_repo_cmd(repo, clone_path)
+  }
+  
+  print(git_cmd)
+  system(git_cmd)
+}
+
+```
+
+## Get Git Commit Log
+
+```{r git_log, eval=FALSE, message=FALSE, echo=FALSE}
+
+for (repo in repos) {
+  git_log_cmd <- get_git_log_cmd(repo, clone_path)
+  print(git_log_cmd)
+  system(git_log_cmd)
+}
+```
+
+## Read in the Commit Logs
+
+```{r gitlog_raw, eval=FALSE, message=FALSE}
+
+gitlog <- tibble()
+
+for (repo in repos) {
+  print(repo)
+  gitlog <- bind_rows(read_git_log(repo, clone_path), gitlog)
+}
+
+saveRDS(gitlog, params$gitlog_rds)
+```
+
+## Dedupe Authors using iGraph
+
+Useful for looking for the same author committing to multiple repos (the group_id will be useful for that).
+
+```{r emails_graph, eval=FALSE, warning=FALSE}
+
+gitlog <-  read_rds(params$gitlog_rds)
+gitlog_networks <- get_gitlog_network(gitlog)
+saveRDS(gitlog_networks, params$gitlog_network_rds)
+```
+
+## Email Domain Identification Using Clearbit
+
+### Clearbit API Retrieval
+
+Get build a domain list for a new repo we haven't run yet. This calls Clearbit's API to get additional domain info.
+
+```{r identify_big_orgs, warning=FALSE, eval=FALSE}
+
+gitlog_networks <- readRDS(params$gitlog_network_rds)
+
+# make a list of domains
+gitlog_networks_domains <- bind_rows(gitlog_networks %>% 
+                                       select(committer_host, committer_domain) %>% 
+                                       rename(host=committer_host, domain=committer_domain), 
+                                     gitlog_networks %>% 
+                                       select(author_host, author_domain) %>%
+                                       rename(host=author_host, domain=author_domain)
+                                     ) %>% unique()
+
+gitlog_networks_domains <- gitlog_networks_domains %>% 
+  group_by(domain) %>% 
+  summarise(host=first(host))
+
+clearbit <- tibble()
+for (n in 1:nrow(gitlog_networks_domains)) {
+  paste(gitlog_networks_domains$host[n])
+  clearbit_url <- paste0("https://company.clearbit.com/v2/companies/find?domain=", gitlog_networks_domains$host[n])
+  #clearbit_get <- GET(clearbit_url, add_headers(Authorization = clearbit_auth))
+  clearbit_get <- GET(clearbit_url, add_headers(Authorization = paste("Bearer", params$clearbit_api_key)))
+  if (clearbit_get$status_code == 422) {
+    next()
+  }
+  clearbit_json <- fromJSON(content(clearbit_get, as = "text"), flatten=TRUE)
+  clearbit_json$domainAliases = paste(clearbit_json$domainAliases, collapse=",")
+  clearbit_json$tags = paste(clearbit_json$tags, collapse=",")
+  clearbit_df <-  clearbit_json %>% unlist() %>% as.data.frame.list()
+  
+  clearbit_df <- clearbit_df %>% 
+    mutate(row=n, 
+           host_looked_up=gitlog_networks_domains$host[n])
+  
+  write_rds(clearbit_df, paste0("domain_info/clearbit_df_", gitlog_networks_domains$domain[n],".Rds"))
+  clearbit <- bind_rows(clearbit, clearbit_df)
+}
+
+saveRDS(clearbit, "dl-frameworks_domain_info.Rds")
+```
+
+
+
+
+
+
